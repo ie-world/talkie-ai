@@ -1,151 +1,200 @@
-from __future__ import annotations
-from typing import Dict, List, Literal, Tuple
+# ------------------------------------------------------------
+# SEGMENTS(단어별 타임스탬프)를 이용해 정확도/속도/공백을 판정하는 로직
+# - 입력:
+#     - target_text: 기준 문장
+#     - result_text: STT 결과 문장
+#     - user_segments: 사용자 발화의 세그먼트 목록
+# - 출력:
+#     issue, accuracy_ok, speed, gaps, wpm_user
+#     + 참고지표(wps_total, wps_art, pause_ms, longest_pause_ms, total_ms, speech_ms, n_words)
+# ------------------------------------------------------------
 
-from app.utils.wpm import normalize, speed_judgment, count_words
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Dict, List, Literal
+import re
 
 Issue = Literal["accuracy", "speed_fast", "speed_slow", "gaps", "good"]
 
+# ===================== 튜닝 가능한 임계치 =====================
 
-# ===== 텍스트 정확성 =====
-def is_text_accurate(target_text: str, result_text: str) -> bool:
+# --- 정확도(WER) ---
+WER_THRESHOLD = 0.20  # 20% 초과면 정확도 이슈
+
+# --- 속도 ---
+ABS_FAST_WPS = 1.90          # 초당 단어수(총시간 기준) ≥ 1.90 → fast
+ABS_FAST_WPS_ART = 2.60      # 초당 단어수(발화시간 기준) ≥ 2.60 → fast
+ABS_SLOW_WPS = 1.00          # 초당 단어수 ≤ 1.00 + 아래 조건 → slow
+ABS_SLOW_MIN_SPEECH_MS = 2000  # 느림 판정은 실제 말한 시간이 2.0s 이상일 때만
+
+# 극단적 빠름 보호장치
+EXTREME_FAST_MAX_TOTAL_MS = 1000  # 총 길이 < 1.0s 이면서
+EXTREME_FAST_MIN_WORDS = 5        # 단어수 ≥ 5 → fast
+
+# --- 공백 ---
+PAUSE_RATIO_THRESHOLD = 0.35      # 전체의 35% 이상이 침묵이면 gaps
+LONGEST_PAUSE_MS_THRESHOLD = 500  # 최장 침묵 ≥ 0.5s 이면 gaps
+
+# =============================================================
+
+# -------------------- 텍스트 정규화 & WER --------------------
+
+_SPACES = re.compile(r"\s+")
+_PUNCTS = re.compile(r"[^\w\s]")  # 구두점 제거(한글/영문/숫자/밑줄 제외)
+
+def _normalize(text: str) -> str:
     """
-    normalize 후 완전 동일해야 '정확'으로 간주
+    한국어용 간단 정규화
+    - 소문자
+    - 구두점 제거
+    - 다중 공백 정리
     """
-    return normalize(target_text) == normalize(result_text)
+    t = text.strip().lower()
+    t = _PUNCTS.sub(" ", t)
+    t = _SPACES.sub(" ", t)
+    return t.strip()
 
-
-# ===== 속도(WPM) 계산 유틸 =====
-def _wpm_pair_by_durations(
-    target_text: str,
-    result_text: str,
-    target_duration_sec: float,
-    user_duration_sec: float,
-) -> Tuple[float, float]:
+def _wer(ref: str, hyp: str) -> float:
     """
-    타깃/사용자 발화 시간을 '초'로 받아 WPM을 계산
-    - target_duration_sec: ref_graph 길이 기반(샘플레이트 50Hz)
-    - user_duration_sec: usr_graph 길이 기반(샘플레이트 50Hz) 또는 실제 녹음 길이
+    WER(Word Error Rate) 계산
+    - 공백 기준 토큰화
+    - 편집거리(삽입/삭제/치환)
     """
-    
-    td = max(float(target_duration_sec or 0), 0.3) # 최소 분모 보호(0.3초)
-    ud = max(float(user_duration_sec or 0), 0.3)
-
-    tw = count_words(target_text)
-    uw = count_words(result_text)
-
-    wpm_target = round(tw / (td / 60.0), 1)
-    wpm_user = round(uw / (ud / 60.0), 1)
-    return wpm_target, wpm_user
-
-
-# ===== 속도(WPM) 판정 =====
-def judge_speed(
-    target_text: str,
-    result_text: str,
-    *,
-    user_duration_sec: float,
-    target_duration_sec: float,
-    slow_factor: float = 0.75,
-    fast_factor: float = 1.25,
-) -> Tuple[str, float, float]:
-    """
-    - target WPM: target_duration_sec 안에 target_text를 읽는다고 가정한 속도
-    - user WPM: user_duration_sec 동안 result_text를 읽은 실제 속도
-    - 판정: 기본 허용 범위 ±25%
-    """
-    wpm_target, wpm_user = _wpm_pair_by_durations(
-        target_text, result_text, target_duration_sec, user_duration_sec
-    )
-    spd = speed_judgment(wpm_user, wpm_target, slow_factor=slow_factor, fast_factor=fast_factor)
-    return spd, wpm_target, wpm_user
-
-
-# ===== 파형 공백(gaps) 판정 =====
-def _total_silence_seconds(
-    series: List[int],
-    sample_rate_hz: int = 50,
-    threshold_mode: Literal["percentile", "rel"] = "percentile",
-    perc: float = 0.15,
-    rel_ratio: float = 0.25,
-    min_run_samples: int = 4,
-) -> float:
-    """
-    시퀀스에서 공백 구간 총 길이(초)를 추정
-    - percentile 모드: 시퀀스의 p-백분위수(디폴트 15%) 이하를 침묵으로 간주
-    - rel 모드: max 값의 rel_ratio(디폴트 25%) 이하를 침묵으로 간주
-    - 최소 연속 길이: min_run_samples 샘플 이상일 때만 공백으로 합산 (50Hz 기준 4샘플=0.08s)
-    """
-    if not series:
+    r = _normalize(ref).split()
+    h = _normalize(hyp).split()
+    if not r and not h:
         return 0.0
+    # DP 테이블
+    R, H = len(r), len(h)
+    d = [[0]*(H+1) for _ in range(R+1)]
+    for i in range(R+1): d[i][0] = i
+    for j in range(H+1): d[0][j] = j
+    for i in range(1, R+1):
+        for j in range(1, H+1):
+            cost = 0 if r[i-1] == h[j-1] else 1
+            d[i][j] = min(
+                d[i-1][j] + 1,      # 삭제
+                d[i][j-1] + 1,      # 삽입
+                d[i-1][j-1] + cost  # 치환
+            )
+    return d[R][H] / max(1, R)
 
-    if threshold_mode == "percentile":
-        arr = sorted(series)
-        idx = max(0, min(len(arr) - 1, int(len(arr) * perc)))
-        thr = arr[idx]
-    else:  # rel모드
-        thr = max(series) * rel_ratio
+# -------------------- 세그먼트 메트릭 --------------------
 
-    # 연속 below-threshold 구간 길이 합산
-    run = 0
-    total_samples = 0
-    for v in series:
-        if v <= thr:
-            run += 1
-        else:
-            if run >= min_run_samples:
-                total_samples += run
-            run = 0
-    if run >= min_run_samples:
-        total_samples += run
+@dataclass
+class SegMetrics:
+    total_ms: int          # 전체 구간 길이
+    speech_ms: int         # 실제 말한 시간(단어 duration 합)
+    pause_ms: int          # 전체 침묵 시간
+    longest_pause_ms: int  # 최장 침묵 길이
+    n_words: int           # 단어 수
+    wps_total: float       # 초당 단어수 (총시간 기준)
+    wps_art: float         # 초당 단어수 (순수 발화시간 기준: 아티큘레이션 속도)
 
-    return total_samples / float(sample_rate_hz)
-
-
-def detect_gaps(
-    ref_graph: List[int],
-    usr_graph: List[int],
-    *,
-    sample_rate_hz: int = 50,
-    mode: Literal["percentile", "rel"] = "percentile",
-    perc: float = 0.15,
-    rel_ratio: float = 0.25,
-    min_run_samples: int = 4,
-    tolerance_ratio: float = 1.3,
-    min_gap_seconds: float = 0.20,
-) -> bool:
+def _merge_segments(segments: List[dict]) -> dict:
     """
-    사용자의 '침묵 총 길이'가 기준보다 현저히 크면 공백 이슈로 간주
-    - tolerance_ratio: 사용자 침묵이 기준의 1.3배 이상이면 공백 이슈
-    - min_gap_seconds: 기준이 0에 매우 가깝더라도, 사용자의 총 침묵이 이 값 이상이면 이슈로 간주
+    여러 세그먼트가 오면 하나로 병합.
+    - start: 최소, end: 최대
+    - words: 전부 모아 시작시간 기준 정렬
+    words 포맷: [start_ms, end_ms, "token"]
     """
-    ref_sil = _total_silence_seconds(
-        ref_graph, sample_rate_hz=sample_rate_hz, threshold_mode=mode,
-        perc=perc, rel_ratio=rel_ratio, min_run_samples=min_run_samples
+    if not segments:
+        return {"start": 0, "end": 0, "words": []}
+    s_min = min(int(s.get("start", 0)) for s in segments)
+    e_max = max(int(s.get("end", s_min)) for s in segments)
+    words = []
+    for s in segments:
+        for w in s.get("words", []):
+            if isinstance(w, dict):
+                ws = int(w.get("start", 0))
+                we = int(w.get("end", ws))
+                tok = str(w.get("token", ""))
+                words.append((ws, we, tok))
+            elif isinstance(w, (list, tuple)) and len(w) >= 2:
+                ws, we = int(w[0]), int(w[1])
+                tok = str(w[2]) if len(w) >= 3 else ""
+                words.append((ws, we, tok))
+    words.sort(key=lambda x: x[0])
+    return {"start": s_min, "end": e_max, "words": words}
+
+def _metrics_from_segments(segments: List[dict]) -> SegMetrics:
+    """
+    segments → 메트릭 추출 (ms 단위)
+    """
+    merged = _merge_segments(segments)
+    start = int(merged.get("start", 0))
+    end = int(merged.get("end", start))
+    total_ms = max(0, end - start)
+
+    words = merged.get("words", [])
+    durations = [max(0, we - ws) for (ws, we, _tok) in words]
+    n_words = len(durations)
+    speech_ms = sum(durations)
+
+    gaps = []
+    for i in range(len(words) - 1):
+        prev_end = words[i][1]
+        next_start = words[i+1][0]
+        gaps.append(max(0, next_start - prev_end))
+    pause_ms = sum(gaps)
+    longest_pause_ms = max(gaps) if gaps else 0
+
+    total_sec = max(total_ms / 1000.0, 1e-3)
+    speech_sec = max(speech_ms / 1000.0, 1e-3)
+
+    wps_total = round(n_words / total_sec, 2)
+    wps_art   = round(n_words / speech_sec, 2)
+
+    return SegMetrics(
+        total_ms=total_ms,
+        speech_ms=speech_ms,
+        pause_ms=pause_ms,
+        longest_pause_ms=longest_pause_ms,
+        n_words=n_words,
+        wps_total=wps_total,
+        wps_art=wps_art,
     )
-    usr_sil = _total_silence_seconds(
-        usr_graph, sample_rate_hz=sample_rate_hz, threshold_mode=mode,
-        perc=perc, rel_ratio=rel_ratio, min_run_samples=min_run_samples
-    )
 
-    gaps_flag = False
-    if usr_sil >= min_gap_seconds:
-        # 기준 대비 현저히 큰지
-        if ref_sil == 0:
-            gaps_flag = True
-        else:
-            gaps_flag = (usr_sil >= ref_sil * tolerance_ratio)
+# -------------------- 판정 로직 --------------------
 
-    return gaps_flag
+def _speed_from_metrics(user: SegMetrics) -> str:
+    """
+    절대 임계치 기반 속도 판정 + 극단적 빠름 보호장치
+    """
+    # 아주 짧은 시간에 단어가 많은 경우: fast
+    if user.total_ms < EXTREME_FAST_MAX_TOTAL_MS and user.n_words >= EXTREME_FAST_MIN_WORDS:
+        return "fast"
 
+    if user.wps_total >= ABS_FAST_WPS or user.wps_art >= ABS_FAST_WPS_ART:
+        return "fast"
 
-# ===== 최종 이슈 결정 =====
+    if user.wps_total <= ABS_SLOW_WPS and user.speech_ms >= ABS_SLOW_MIN_SPEECH_MS:
+        return "slow"
+
+    return "ok"
+
+def _gaps_from_metrics(user: SegMetrics) -> bool:
+    """
+    공백 판정:
+      - 전체 중 침묵 비율이 높거나
+      - 최장 침묵이 길면 gaps=True
+    """
+    if user.total_ms <= 0:
+        return False
+    pause_ratio = user.pause_ms / user.total_ms
+    if pause_ratio >= PAUSE_RATIO_THRESHOLD:
+        return True
+    if user.longest_pause_ms >= LONGEST_PAUSE_MS_THRESHOLD:
+        return True
+    return False
+
 def decide_issue(accuracy_ok: bool, speed: str, gaps: bool) -> Issue:
     """
     우선순위:
-      1) 정확성 문제 (accuracy=false)
-      2) 속도 문제 ('fast'/'slow')
-      3) 공백 문제 (gaps=true)
-      4) 그 외 'good'
+      1) 정확성
+      2) 속도
+      3) 공백
+      4) 양호
     """
     if not accuracy_ok:
         return "accuracy"
@@ -157,50 +206,46 @@ def decide_issue(accuracy_ok: bool, speed: str, gaps: bool) -> Issue:
         return "gaps"
     return "good"
 
+# -------------------- 메인: 세그먼트 기반 분석 --------------------
 
-# ===== 최종 분석 =====
-def analyze_feedback(
+def analyze_feedback_with_segments(
     *,
     target_text: str,
     result_text: str,
-    target_duration_sec: float,
-    user_duration_sec: float,
-    ref_graph: List[int],
-    usr_graph: List[int],
+    user_segments: List[dict],
 ) -> Dict:
+    """
+    segments만으로 정확도/속도/공백을 분석한다.
+    """
+    # 1) 정확도(WER)
+    wer_val = _wer(target_text, result_text)
+    accuracy_ok = (wer_val <= WER_THRESHOLD)
 
-    # 1) 정확성
-    acc_ok = is_text_accurate(target_text, result_text)
+    # 2) 메트릭 추출
+    m = _metrics_from_segments(user_segments)
 
-    # 2) 속도
-    spd, wpm_target, wpm_user = judge_speed(
-        target_text=target_text,
-        result_text=result_text,
-        user_duration_sec=float(user_duration_sec),
-        target_duration_sec=float(target_duration_sec),
-    )
-
-    # 3) 공백
-    gaps_flag = detect_gaps(
-        ref_graph=ref_graph,
-        usr_graph=usr_graph,
-        sample_rate_hz=50,
-        mode="percentile",
-        perc=0.15,
-        rel_ratio=0.25,
-        min_run_samples=4,
-        tolerance_ratio=1.3,
-        min_gap_seconds=0.10,
-    )
+    # 3) 속도/공백 판정
+    speed = _speed_from_metrics(m)
+    gaps = _gaps_from_metrics(m)
 
     # 4) 최종 이슈
-    issue = decide_issue(acc_ok, spd, gaps_flag)
+    issue = decide_issue(accuracy_ok, speed, gaps)
 
+    # 5) 반환 (WPM: 분당 단어수)
     return {
         "issue": issue,
-        "accuracy_ok": acc_ok,
-        "speed": "ok" if spd not in ("fast", "slow") else spd,
-        "gaps": gaps_flag,
-        "wpm_target": wpm_target,
-        "wpm_user": wpm_user,
+        "accuracy_ok": accuracy_ok,
+        "speed": speed,                # "fast" | "slow" | "ok"
+        "gaps": gaps,
+        "wpm_user": round(m.wps_total * 60.0, 1),
+
+        # 튜닝용 참고 지표
+        "wer": round(wer_val, 3),
+        "wps_total": m.wps_total,
+        "wps_art": m.wps_art,
+        "pause_ms": m.pause_ms,
+        "longest_pause_ms": m.longest_pause_ms,
+        "total_ms": m.total_ms,
+        "speech_ms": m.speech_ms,
+        "n_words": m.n_words,
     }

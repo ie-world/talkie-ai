@@ -72,52 +72,73 @@ def build_chat_prompt(topic: str, history: list[dict], user_input: str | None) -
 
 
 # 피드백 생성용 프롬프트
+def _issue_instruction(issue: str, speed: str, gaps: bool) -> str:
+    """
+    이슈 유형에 따라 한 문장 피드백 지시문을 선택
+    - 반환 텍스트는 '모델에게 줄 지시'가 아니라 '학습자에게 줄 메시지'의 톤/방향을 설명하는 문장
+    """
+    if issue == "accuracy":
+        return (
+            "정확도 문제가 있으니 기준 문장과 다른 단어를 바로잡아 주고, "
+            "학습자가 다음에 어떻게 말하면 좋을지 간단한 지침을 한 문장으로 제시하세요."
+        )
+    if issue == "speed_fast":
+        return (
+            "속도가 지나치게 빠르니 속도를 약간 늦추도록 권하고, 호흡을 고르고 끊지 않고 자연스럽게 말하라는 조언을 한 문장으로 제시하세요."
+        )
+    if issue == "speed_slow":
+        return (
+            "속도가 느리니 약간 빠르게 말하되 한 호흡으로 자연스럽게 이어 말하라는 조언을 한 문장으로 제시하세요."
+        )
+    if issue == "gaps":
+        return (
+            "단어 사이 공백이 크니 단어를 붙여서 자연스럽게 이어 말하라고 안내하는 한 문장을 제시하세요."
+        )
+    # good
+    return (
+        "전반적으로 발음과 속도가 좋으니 간단히 칭찬하고, 다음에도 같은 리듬으로 이어가라고 격려하는 한 문장을 제시하세요."
+    )
+
+
 def build_feedback_messages(
     *,
     target_text: str,
     result_text: str,
-    assessment_score: int,
-    assessment_details: str,
-    wpm_target: float,
-    wpm_user: float,
-    issue: str,               # 'accuracy' | 'speed_fast' | 'speed_slow' | 'gaps' | 'good'
+    issue: str,          # "accuracy" | "speed_fast" | "speed_slow" | "gaps" | "good"
     accuracy_ok: bool,
-    speed: str,               # 'fast' | 'slow' | 'ok'
-    gaps: bool
-) -> List[Dict]:
+    speed: str,          # "fast" | "slow" | "ok"
+    gaps: bool,
+    wpm_user: float,     # 분당 단어수
+) -> List[dict]:
+    
+    # 시스템 규칙: 반드시 한 문장, 한국어, 과도한 친절말투/감탄사 남용 금지
+    system_content = (
+        "너는 성인 한국어 학습자를 위한 간단 피드백 생성기다.\n"
+        "지침:\n"
+        "1) 한국어로 한 문장만 생성한다. 2) 50자 이내를 권장한다.\n"
+        "3) 이모지, 특수문자, 따옴표, 마크다운, 순번, 불릿 사용 금지.\n"
+        "4) 장황한 설명, 반복, 사족 금지. 5) 존대하되 단정적으로 짧게.\n"
+        "6) 아래 분석 결과를 반영해 가장 중요한 한 가지만 명확히 조언한다."
+    )
 
-    system = {
-        "role": "system",
-        "content": (
-            "너는 성인의 한국어 발음 학습을 돕는 코치야.\n"
-            "입력으로 발음 평가 결과와 분석 요약이 주어지면, 학습자에게 도움이 되는 '짧은 한국어 피드백'을 1문장만 생성해.\n"
-            "규칙:\n"
-            "1) 친절하고 격려하는 말투를 사용해.\n"
-            "2) 출력은 '문장 하나'만, 불필요한 설명/목록/불릿/이모지/강조 금지.\n"
-            "3) 가능한 한 구체적이고 실행 가능한 조언을 1개만 담아.\n"
-            "4) 너무 기술적인 용어는 피하고, 쉬운 단어를 사용해.\n"
-            "5) 맞춤법과 띄어쓰기를 정확히 지켜.\n"
-            "6) 아래 이슈 유형별 코칭 가이드를 우선 적용해:\n"
-            "   - accuracy: 정답 문장과 달랐다면, 출력은 '정확하게 말해볼까요?' 로만 답해. 다른 말은 붙이지 마.\n"
-            "   - speed_fast: 속도가 빨랐다면, 한 단어씩 끊지 말고 호흡을 고르며 천천히 말하도록 유도.\n"
-            "   - speed_slow: 속도가 느리다면, 끊기는 부분을 줄이고 한 호흡에 자연스럽게 이어 말하도록 유도.\n"
-            "   - gaps: 불필요한 공백이 있었다면, 단어 사이 간격을 줄이고 자연스럽게 '붙여서' 말하도록 유도.\n"
-            "   - good: 전반적으로 좋다면, 잘한 점을 짧게 칭찬하고 유지하도록 안내.\n"
-        )
-    }
+    # 이슈별 지시
+    instruction = _issue_instruction(issue, speed, gaps)
 
-    # 모델이 상황을 정확히 파악하도록 구조화된 사실 정보를 user에 전달
-    user = {
-        "role": "user",
-        "content": (
-            f"[기준 문장] {target_text}\n"
-            f"[인식 문장] {result_text}\n"
-            f"[총점] {assessment_score}\n"
-            f"[단어별 점수(원문)] {assessment_details}\n"
-            f"[WPM] target={wpm_target}, user={wpm_user}\n"
-            f"[판정] issue={issue}, accuracy_ok={accuracy_ok}, speed={speed}, gaps={gaps}\n"
-            "위 정보를 바탕으로 학습자에게 도움 되는 짧은 한국어 피드백 '문장 하나'만 만들어줘."
-        )
-    }
+    # 모델이 참고할 컨텍스트
+    context = (
+        f"[기준 문장] {target_text}\n"
+        f"[인식 문장] {result_text}\n"
+        f"[판정] issue={issue}, accuracy_ok={accuracy_ok}, speed={speed}, gaps={gaps}, wpm_user={wpm_user:.1f}"
+    )
 
-    return [system, user]
+    # 사용자 프롬프트
+    user_content = (
+        f"{instruction}\n\n"
+        f"{context}\n\n"
+        "출력 형식: 한국어 한 문장. 조언 핵심만 간결히. 추가 문장, 인용부호, 이모지 금지."
+    )
+
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
+    ]

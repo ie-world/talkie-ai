@@ -1,57 +1,72 @@
-from typing import List, Optional, Literal
-from pydantic import BaseModel, Field, field_validator
+from __future__ import annotations
+from typing import List, Literal, Any
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
+# ===== 내부 구조 =====
 
-# ====== Request ======
+class WordItem(BaseModel):
+    """단어 타임스탬프 한 항목"""
+    start: int = Field(..., description="단어 시작(ms)")
+    end: int = Field(..., description="단어 종료(ms)")
+    token: str = Field("", description="인식된 토큰(단어)")
+
+class Segment(BaseModel):
+    """
+    STT 세그먼트
+    - words가 [[start,end,"token"], ...] 형태 -> 객체로 변환
+    """
+    model_config = ConfigDict(extra="ignore")  # text/confidence 등 기타 필드는 무시
+
+    start: int = Field(..., description="세그먼트 시작(ms)")
+    end: int = Field(..., description="세그먼트 종료(ms)")
+    words: List[WordItem] = Field(default_factory=list, description="단어 단위 타임스탬프")
+
+    @field_validator("words", mode="before")
+    @classmethod
+    def _coerce_words(cls, v: Any) -> List[WordItem]:
+        if v is None:
+            return []
+        # [[s,e,'tok']] 형태를 WordItem 리스트로 변환
+        if isinstance(v, list) and v and isinstance(v[0], list):
+            converted = []
+            for item in v:
+                if len(item) >= 2:
+                    s = int(item[0]); e = int(item[1])
+                    tok = str(item[2]) if len(item) >= 3 else ""
+                    converted.append(WordItem(start=s, end=e, token=tok))
+            return converted
+        return v
+
+# ===== 요청/응답 =====
+
+SpeedLabel = Literal["fast", "slow", "ok"]
+IssueLabel = Literal["accuracy", "speed_fast", "speed_slow", "gaps", "good"]
+
 class FeedbackRequest(BaseModel):
     """
-    발음 평가 결과를 받아 AI 피드백 생성을 요청하는 바디
+    발음 피드백 요청
     """
-    target_text: str = Field(..., description="학습자가 읽어야 하는 기준 문장")
-    result_text: str = Field(..., description="STT 결과(Clova Speech API 인식 텍스트)")
-    
-    duration: Optional[float] = Field(
-        None, ge=0, description="실제 녹음 길이(초), 없으면 usr_graph 길이로 계산..."
-    )
+    target_text: str = Field(..., description="기준 문장")
+    result_text: str = Field(..., description="STT 인식 결과 문장")
+    segments: List[Segment] = Field(..., description="사용자 발화 세그먼트")
 
-    assessment_score: int = Field(..., ge=1, le=100, description="문장 전체 발음 점수 (1~100)")
-    assessment_details: str = Field(..., description="매 단어마다의 평가 점수")
-    ref_graph: List[int] = Field(..., description="기준 발음 파형 그래프(Hz=50)")
-    usr_graph: List[int] = Field(..., description="사용자 발음 파형 그래프(Hz=50)")
-
-    @field_validator("ref_graph", "usr_graph")
-    @classmethod
-    def graphs_must_be_positive(cls, v: List[int]):
-        if any(x < 0 for x in v):
-            raise ValueError("그래프 수치(ref_graph, usr_graph)는 모두 양의 정수여야 합니다.")
-        return v
-
-    @field_validator("duration")
-    @classmethod
-    def duration_nonnegative(cls, v: Optional[float]):
-        if v is not None and v < 0:
-            raise ValueError("duration은 0 이상이어야 합니다.")
-        return v
-
-
-# ====== Response ======
 class FeedbackAnalysis(BaseModel):
-    """
-    내부 판단 결과(정확성/속도/공백)와 보조 지표를 함께 반환
-    """
-    issue: Literal["accuracy", "speed_fast", "speed_slow", "gaps", "good"] = Field(
-        ..., description="주된 이슈 유형"
-    )
-    accuracy_ok: bool = Field(..., description="정확성 통과 여부")
-    speed: Literal["fast", "slow", "ok"] = Field(..., description="속도 판정")
-    gaps: bool = Field(..., description="파형 공백 이슈 여부")
-    wpm_target: Optional[float] = Field(None, description="기준 문장 추정 WPM")
-    wpm_user: Optional[float] = Field(None, description="사용자 발화 WPM")
+    issue: IssueLabel
+    accuracy_ok: bool
+    speed: SpeedLabel
+    gaps: bool
+    wpm_user: float
 
+    # 튜닝용 참고 지표
+    wer: float
+    wps_total: float
+    wps_art: float
+    pause_ms: int
+    longest_pause_ms: int
+    total_ms: int
+    speech_ms: int
+    n_words: int
 
 class FeedbackResponse(BaseModel):
-    """
-    최종 사용자 노출용 피드백 문구 + 내부 분석 리포트
-    """
-    feedback_text: str = Field(..., description="AI가 생성한 피드백 문장")
+    feedback_text: str
     analysis: FeedbackAnalysis
